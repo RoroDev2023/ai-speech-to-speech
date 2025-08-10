@@ -6,9 +6,10 @@ import base64
 from datetime import datetime
 
 # --- Azure Log Config ---
-workspace_id = "529ae8c4-c46d-476a-ba45-9f17906689ae"
-shared_key = "OuVI9EnS4EG6h8RQWR+aaRQNiBYVlsNItvk0sW/Le9Ifa0tvDsugVAAy8Ct33gQ7xzqOo05qVSwMHpj9jK9b+w=="
-log_type = "VoiceRAGLogs_Custom"
+WORKSPACE_ID=your_workspace_id_here
+SHARED_KEY=your_shared_key_here
+LOG_TYPE=VoiceRAGLogs_Custom
+
 
 def build_signature(customer_id, shared_key, date, content_length, method, content_type, resource):
     x_headers = f'x-ms-date:{date}'

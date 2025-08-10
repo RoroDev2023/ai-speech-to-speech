@@ -8,7 +8,7 @@ from datetime import datetime
 import base64
 import azure.cognitiveservices.speech as speechsdk
 from azure.storage.blob import BlobServiceClient
-from log import send_log, workspace_id, shared_key, log_type
+# from log import send_log, workspace_id, shared_key, log_type # You'll need to uncomment this if you use the logging function
 import wave
 import os
 import uuid
@@ -18,6 +18,9 @@ import aiohttp
 from aiohttp import web
 from azure.core.credentials import AzureKeyCredential
 from azure.identity import DefaultAzureCredential, get_bearer_token_provider
+
+# You must have your logger file (`log.py`) in the same directory as this script.
+from log import send_log, workspace_id, shared_key, log_type
 
 print("✅ RTMT MODULE LOADED")
 
@@ -30,6 +33,10 @@ logging.basicConfig(
 )
 
 # Azure credentials (as provided in your snippet)
+SPEECH_KEY=your_speech_key_here
+SPEECH_REGION=your_region_here
+BLOB_CONNECTION_STRING=your_blob_connection_string_here
+BLOB_CONTAINER=your_container_name_here
 
 
 blob_service_client = BlobServiceClient.from_connection_string(BLOB_CONNECTION_STRING)
@@ -75,11 +82,28 @@ def synthesize_and_upload(text: str, filename: str) -> str:
         return ""
 
 def save_pcm_to_wav(pcm_bytes, filename):
+    """
+    Saves a byte array of raw PCM audio data into a valid WAV file.
+    A small buffer of silence is added at the beginning to prevent truncation.
+    """
+    # Define audio parameters
+    sample_rate = 24000
+    sample_width = 2
+    num_channels = 1
+    
+    # Create 500ms of silence
+    silence_duration_ms = 500
+    silence_frames = int(sample_rate * silence_duration_ms / 1000)
+    silence_bytes = b'\x00' * silence_frames * sample_width * num_channels
+    
+    # Prepend silence to the actual audio data
+    buffered_pcm_bytes = silence_bytes + pcm_bytes
+
     with wave.open(filename, "wb") as wf:
-        wf.setnchannels(1)        # mono
-        wf.setsampwidth(2)        # 2 bytes = 16-bit samples
-        wf.setframerate(48000)    # 48 kHz
-        wf.writeframes(pcm_bytes)
+        wf.setnchannels(num_channels)
+        wf.setsampwidth(sample_width)
+        wf.setframerate(sample_rate)
+        wf.writeframes(buffered_pcm_bytes)
 
 
 class ToolResultDirection(Enum):
@@ -129,45 +153,10 @@ class RTMiddleTier:
         self._last_user_timestamp = None
         self._last_user_audio_url = None
 
-        # ✅ Buffer for accumulating raw containerized audio chunks
+        # Buffer for accumulating user audio chunks
         self._user_audio_buffer = bytearray()
-        # save first bytes for container detection
-        self._user_audio_sample = bytearray()
-        # partial file path for immediate appended chunks
-        self._user_part_path: Optional[str] = None
-        # unique id for current utterance (used in part filename)
-        self._current_utterance_id: Optional[str] = None
-
-    def _detect_extension_from_bytes(self, sig: bytes) -> str:
-        """
-        Try to detect a likely file extension from the start of the buffer.
-        Checks a few common signatures for webm/ogg/wav/mp3. Fallback '.bin'.
-        """
-        if not sig:
-            print("🔍 DEBUG: Empty signature, defaulting to .bin")
-            return ".bin"
-        
-        print(f"🔍 DEBUG: Detecting extension from {len(sig)} bytes: {sig[:16].hex()}")
-        
-        # RIFF WAVE
-        if len(sig) >= 12 and sig.startswith(b"RIFF") and b"WAVE" in sig[:12]:
-            print("🔍 DEBUG: Detected WAV format")
-            return ".wav"
-        # OggS
-        if sig.startswith(b"OggS"):
-            print("🔍 DEBUG: Detected OGG format")
-            return ".ogg"
-        # EBML header for Matroska/WebM: 0x1A45DFA3
-        if len(sig) >= 4 and sig[0:4] == b"\x1A\x45\xDF\xA3":
-            print("🔍 DEBUG: Detected WebM format")
-            return ".webm"
-        # ID3 tag (MP3) or frame header 0xFF
-        if sig.startswith(b"ID3") or (len(sig) >= 2 and (sig[0] & 0xFF) == 0xFF):
-            print("🔍 DEBUG: Detected MP3 format")
-            return ".mp3"
-        
-        print(f"🔍 DEBUG: Unknown format, defaulting to .bin (first 4 bytes: {sig[:4].hex()})")
-        return ".bin"
+        # flag to know when an utterance has started
+        self._is_recording_user_audio = False
 
     async def _process_message_to_client(self, msg, client_ws: web.WebSocketResponse, server_ws: web.WebSocketResponse) -> Optional[str]:
         # msg is an aiohttp WS message from the realtime server
@@ -182,65 +171,30 @@ class RTMiddleTier:
                 message = {}
 
         print("⬅️ FROM SERVER:", getattr(msg, "data", "<no data>"))
-        try:
-            print("🔍 Full transcription message:", json.dumps(message, indent=2))
-        except Exception:
-            pass
 
-        # Handle completed audio transcription for the user
+        # Handle user audio transcription events
         if message.get("type") == "conversation.item.input_audio_transcription.completed":
             transcript = message.get("transcript", "")
             print(f"🔍 DEBUG: Transcription completed. Transcript: '{transcript}'")
-            print(f"🔍 DEBUG: Buffer size at transcription: {len(self._user_audio_buffer)} bytes")
-            print(f"🔍 DEBUG: Sample size: {len(self._user_audio_sample)} bytes")
-            
-            if self._user_audio_buffer:
-                print(f"🔍 DEBUG: First 16 bytes of buffer: {bytes(self._user_audio_buffer[:16]).hex()}")
-            else:
-                print("🔍 DEBUG: ⚠️ User audio buffer is EMPTY at transcription completion!")
 
-            if transcript:
+            if transcript and self._is_recording_user_audio:
                 print(f"\n👤 USER: {transcript}")
                 self._last_user_question = transcript
                 self._last_user_timestamp = datetime.utcnow().isoformat()
 
-                # ✅ Save accumulated audio now that transcription is complete
+                # Always save the buffered audio as a WAV file
                 if self._user_audio_buffer:
                     try:
-                        # detect extension from sample or buffer
-                        sample = bytes(self._user_audio_sample[:64]) or bytes(self._user_audio_buffer[:64])
-                        ext = self._detect_extension_from_bytes(sample)
                         ts = int(datetime.utcnow().timestamp() * 1000)
-                        user_filename = os.path.join(LOCAL_AUDIO_DIR, f"user_{ts}{ext}")
-
-                        print(f"🔍 DEBUG: Saving {len(self._user_audio_buffer)} bytes to {user_filename}")
-
-                        # write the accumulated bytes directly (we assume browser sent a container like webm/ogg/wav/mp3)
-                        with open(user_filename, "wb") as f:
-                            f.write(self._user_audio_buffer)
-
+                        user_filename = os.path.join(LOCAL_AUDIO_DIR, f"user_{ts}.wav")
+                        
+                        # Use the save_pcm_to_wav function to correctly format the buffered data
+                        save_pcm_to_wav(self._user_audio_buffer, user_filename)
+                        
                         abs_user_filename = os.path.abspath(user_filename)
                         print(f"✅ Saved complete user audio: {abs_user_filename}")
 
-                        # Verify file was actually written
-                        if os.path.exists(user_filename):
-                            file_size = os.path.getsize(user_filename)
-                            print(f"🔍 DEBUG: Verified file exists with size: {file_size} bytes")
-                        else:
-                            print("🔍 DEBUG: ❌ File was not created!")
-
-                        # remove partial file if exists (we already have final file)
-                        if self._user_part_path and os.path.exists(self._user_part_path):
-                            try:
-                                os.remove(self._user_part_path)
-                                print(f"🧹 Removed partial file: {self._user_part_path}")
-                            except Exception as e:
-                                print("⚠️ Could not remove partial file:", e)
-                            finally:
-                                self._user_part_path = None
-                                self._current_utterance_id = None
-
-                        # Upload to Azure Blob (optional - can be commented out if you only want local saving)
+                        # Upload to Azure Blob
                         try:
                             with open(user_filename, "rb") as data:
                                 blob_client = container_client.get_blob_client(blob=os.path.basename(user_filename))
@@ -250,34 +204,18 @@ class RTMiddleTier:
                         except Exception as e:
                             print(f"❌ Failed to upload user audio to Azure (local saved OK): {e}")
 
-                        # list folder contents for debugging
-                        try:
-                            files = os.listdir(LOCAL_AUDIO_DIR)
-                            print(f"📂 recorded_audios contents ({len(files)} files): {files}")
-                        except Exception as e:
-                            print("⚠️ Could not list recorded_audios:", e)
-
                     except Exception as e:
                         print(f"❌ Failed to save/upload user audio: {e}")
                         import traceback
                         traceback.print_exc()
                     finally:
-                        # Reset buffers for next utterance
+                        # Reset buffers and flag for the next utterance
                         print("🔍 DEBUG: Clearing audio buffers for next utterance")
                         self._user_audio_buffer.clear()
-                        self._user_audio_sample.clear()
-                        self._user_part_path = None
-                        self._current_utterance_id = None
+                        self._is_recording_user_audio = False
 
                 else:
-                    print("🔍 DEBUG: ⚠️ No user audio buffer to save at transcription completion - this indicates audio capture failed!")
-
-                # Log
-                try:
-                    logger.info(f"[{self._last_user_timestamp}] USER AUDIO: {self._last_user_audio_url or 'N/A'}")
-                    logger.info(f"[{self._last_user_timestamp}] USER TEXT: {transcript}")
-                except Exception as e:
-                    print(f"❌ Logging user audio failed: {e}")
+                    print("🔍 DEBUG: ⚠️ No user audio buffer to save at transcription completion.")
 
         # Handle text inputs from user forwarded by server
         if message.get("type") == "conversation.input":
@@ -321,8 +259,9 @@ class RTMiddleTier:
                         "timestamp": self._last_user_timestamp or datetime.utcnow().isoformat()
                     }]
                     send_log(workspace_id, shared_key, log_type, log_data)
+                    print("✅ Log sent successfully to Azure workspace.")
                 except Exception as e:
-                    print(f"❌ Failed to send log: {e}")
+                    print(f"❌ Failed to send log to Azure: {e}")
 
                 logger.info(f"[{self._last_user_timestamp}] USER: {self._last_user_question}")
                 logger.info(f"[{datetime.utcnow().isoformat()}] MODEL: {final_transcript}")
@@ -382,93 +321,22 @@ class RTMiddleTier:
                             except Exception:
                                 payload = None
 
-                            # Handle input_audio_buffer.append events (this is how user audio is actually sent!)
+                            # Handle input_audio_buffer.append events
                             if payload and payload.get("type") == "input_audio_buffer.append":
                                 try:
                                     audio_data = payload.get("audio", "")
                                     if audio_data:
-                                        # The audio data is base64 encoded in the "audio" field
                                         chunk = base64.b64decode(audio_data)
-                                        print(f"🔍 DEBUG: Received input_audio_buffer.append with {len(chunk)} bytes")
-                                        if chunk:
-                                            print(f"🔍 DEBUG: First 16 bytes of audio buffer chunk: {chunk[:16].hex()}")
-                                        
-                                        # initialize part file if needed
-                                        if not self._current_utterance_id:
-                                            self._current_utterance_id = uuid.uuid4().hex
-                                            part_name = f"user_{int(datetime.utcnow().timestamp()*1000)}_{self._current_utterance_id}.part"
-                                            self._user_part_path = os.path.join(LOCAL_AUDIO_DIR, part_name)
-                                            print(f"🟢 Created new partial file: {self._user_part_path}")
-
-                                        # append chunk to partial file
-                                        try:
-                                            with open(self._user_part_path, "ab") as pf:
-                                                pf.write(chunk)
-                                            print(f"📥 Appended {len(chunk)} bytes to partial file ({self._user_part_path}).")
-                                        except Exception as e:
-                                            print("❌ Failed to append to partial file:", e)
-
-                                        # keep a small sample for extension detection later
-                                        if not self._user_audio_sample:
-                                            self._user_audio_sample.extend(chunk[:128])
-                                            print(f"🔍 DEBUG: Captured audio sample of {len(self._user_audio_sample)} bytes")
-
-                                        # keep full buffer for final write on transcription completion
                                         self._user_audio_buffer.extend(chunk)
+                                        self._is_recording_user_audio = True
                                         print(f"📥 Received input_audio_buffer.append (len={len(chunk)}). Buffer size now {len(self._user_audio_buffer)} bytes.")
 
-                                        # Forward the original JSON message to server (not binary)
-                                        try:
-                                            await target_ws.send_str(msg.data)
-                                            handled = True
-                                            print("✅ Forwarded input_audio_buffer.append event to server")
-                                        except Exception as e:
-                                            print("❌ Failed to forward input_audio_buffer.append to server:", e)
+                                        # Forward the original JSON message to server
+                                        await target_ws.send_str(msg.data)
+                                        handled = True
                                 except (binascii.Error, ValueError) as e:
                                     print("❌ Failed to decode audio data from input_audio_buffer.append:", e)
-
-                            # Legacy support: If client sends base64 audio inside a custom message format
-                            elif payload and payload.get("audio_base64"):
-                                try:
-                                    chunk = base64.b64decode(payload["audio_base64"])
-                                    print(f"🔍 DEBUG: Received legacy base64 audio chunk of {len(chunk)} bytes")
-                                    if chunk:
-                                        print(f"🔍 DEBUG: First 16 bytes of base64 chunk: {chunk[:16].hex()}")
-                                    
-                                    # initialize part file if needed
-                                    if not self._current_utterance_id:
-                                        self._current_utterance_id = uuid.uuid4().hex
-                                        part_name = f"user_{int(datetime.utcnow().timestamp()*1000)}_{self._current_utterance_id}.part"
-                                        self._user_part_path = os.path.join(LOCAL_AUDIO_DIR, part_name)
-                                        print(f"🟢 Created new partial file: {self._user_part_path}")
-
-                                    # append chunk to partial file
-                                    try:
-                                        with open(self._user_part_path, "ab") as pf:
-                                            pf.write(chunk)
-                                        print(f"📥 Appended {len(chunk)} bytes to partial file ({self._user_part_path}).")
-                                    except Exception as e:
-                                        print("❌ Failed to append to partial file:", e)
-
-                                    # keep a small sample for extension detection later
-                                    if not self._user_audio_sample:
-                                        self._user_audio_sample.extend(chunk[:128])
-                                        print(f"🔍 DEBUG: Captured audio sample of {len(self._user_audio_sample)} bytes")
-
-                                    # keep full buffer for final write on transcription completion
-                                    self._user_audio_buffer.extend(chunk)
-                                    print(f"📥 Received base64 chunk (len={len(chunk)}). Buffer size now {len(self._user_audio_buffer)} bytes.")
-
-                                    # Forward binary chunk to the realtime server so transcription works
-                                    try:
-                                        await target_ws.send_bytes(chunk)
-                                        handled = True
-                                        print("✅ Forwarded base64 chunk to server")
-                                    except Exception as e:
-                                        print("❌ Failed to forward decoded base64 chunk to target_ws:", e)
-                                except (binascii.Error, ValueError) as e:
-                                    print("❌ Failed to decode audio_base64:", e)
-
+                                
                             if handled:
                                 continue
 
@@ -481,57 +349,25 @@ class RTMiddleTier:
                                 print("Failed to process client message:", e)
 
                         elif msg.type == aiohttp.WSMsgType.BINARY:
-                            # Accumulate chunks, append to a .part file for immediate local recording,
-                            # and forward them to the realtime server.
+                            # This path handles clients sending raw binary audio chunks
                             try:
                                 chunk = msg.data
                                 print(f"🔍 DEBUG: Received binary audio chunk of {len(chunk)} bytes")
-                                if chunk:
-                                    print(f"🔍 DEBUG: First 16 bytes of binary chunk: {chunk[:16].hex()}")
-                                    
-                                    # initialize an utterance id / part file if needed
-                                    if not self._current_utterance_id:
-                                        # unique id so simultaneous connections don't clobber each other
-                                        self._current_utterance_id = uuid.uuid4().hex
-                                        part_name = f"user_{int(datetime.utcnow().timestamp()*1000)}_{self._current_utterance_id}.part"
-                                        self._user_part_path = os.path.join(LOCAL_AUDIO_DIR, part_name)
-                                        print(f"🟢 Created new partial file: {self._user_part_path}")
+                                
+                                # Append the chunk to the buffer
+                                self._user_audio_buffer.extend(chunk)
+                                self._is_recording_user_audio = True
+                                print(f"📥 Received binary audio chunk (len={len(chunk)}). Buffer size now {len(self._user_audio_buffer)} bytes.")
 
-                                    # append chunk to partial file immediately (so it's available on disk)
-                                    try:
-                                        with open(self._user_part_path, "ab") as pf:
-                                            pf.write(chunk)
-                                        print(f"📥 Appended {len(chunk)} bytes to partial file ({self._user_part_path}).")
-                                    except Exception as e:
-                                        print("❌ Failed to append to partial file:", e)
-
-                                    # keep a small sample for extension detection later
-                                    if not self._user_audio_sample:
-                                        self._user_audio_sample.extend(chunk[:128])
-                                        print(f"🔍 DEBUG: Captured audio sample of {len(self._user_audio_sample)} bytes")
-
-                                    # keep full buffer for final write on transcription completion
-                                    self._user_audio_buffer.extend(chunk)
-                                    print(f"📥 Received binary audio chunk (len={len(chunk)}). Buffer size now {len(self._user_audio_buffer)} bytes.")
-
-                                # Forward binary chunk so transcription still works
-                                try:
-                                    await target_ws.send_bytes(chunk)
-                                    print("✅ Forwarded binary chunk to server")
-                                except Exception as e:
-                                    print("❌ Failed to forward binary chunk to target_ws:", e)
+                                # Forward the binary chunk to the server
+                                await target_ws.send_bytes(chunk)
+                                print("✅ Forwarded binary chunk to server")
                             except Exception as e:
                                 print("❌ Failed to handle/forward binary audio chunk:", e)
-                                # fallback: try forwarding raw data
-                                try:
-                                    await target_ws.send_bytes(msg.data)
-                                    print("⚠️ Used fallback forwarding for binary data")
-                                except Exception as e2:
-                                    print("❌ Failed to forward binary to server as fallback:", e2)
-
+                        
                         else:
                             print("⚠️ Unexpected message type from client:", msg.type)
-
+                    
                     if target_ws:
                         print("🔌 Closing OpenAI's realtime socket connection.")
                         await target_ws.close()
