@@ -176,3 +176,4 @@ This template uses [Managed Identity](https://learn.microsoft.com/entra/identity
 * [Demo video: VoiceRAG](https://youtu.be/vXJka8xZ9Ko)
 * [Azure OpenAI Realtime Documentation](https://github.com/Azure-Samples/aoai-realtime-audio-sdk/)# ai_sts
 # ai-sts
+# ai-speech-to-speech
